@@ -1,0 +1,69 @@
+name: Brush performance
+
+on:
+  push:
+    branches: [main, 'fix/**']
+    paths: ['crates/paint/**', 'crates/engine/src/brush_cmds*', 'crates/engine/src/brush_cmds/**', 'Cargo.toml', 'Cargo.lock', '.github/workflows/brush-performance.yml']
+  pull_request:
+    paths: ['crates/paint/**', 'crates/engine/src/brush_cmds*', 'crates/engine/src/brush_cmds/**', 'Cargo.toml', 'Cargo.lock', '.github/workflows/brush-performance.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: brush-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  brush:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: '4'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_INCREMENTAL: '0'
+      PHOTOCRAFT_NO_PRINT: '1'
+      LPDEST: photocraft-no-such-printer
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: brush-performance
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Pixel and allocation regressions
+        run: cargo test --locked -p photocraft-paint
+      - name: Live stroke and undo regressions
+        run: cargo test --locked -p photocraft-engine --lib brush_cmds::tests
+      - name: Symmetry preview regressions
+        run: cargo test --locked -p photocraft-engine --lib symmetry_cmds::preset_tests
+      - name: Lint brush code
+        run: cargo clippy --locked -p photocraft-paint --all-targets -- -D warnings
+      - name: Web compilation
+        run: cargo check --locked --target wasm32-unknown-unknown -p photocraft-paint -p photocraft-engine
+      # Runner timings vary: publish measurements; deterministic tests gate pixels,
+      # bounded scratch memory, tile sharing, and restoration correctness.
+      - name: Release performance sample
+        run: cargo run --release --locked -p photocraft-paint --example bench_interactive_brush -- --quick --json target/brush-performance.json
+      - name: Serial performance sample
+        env:
+          RAYON_NUM_THREADS: '1'
+        run: cargo run --release --locked -p photocraft-paint --example bench_interactive_brush -- --quick --json target/brush-performance-serial.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: brush-performance-${{ matrix.os }}
+          path: target/brush-performance*.json
+          if-no-files-found: warn
