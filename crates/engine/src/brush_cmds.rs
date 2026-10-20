@@ -426,15 +426,15 @@ pub struct LiveStroke {
     symmetry: Option<crate::symmetry_cmds::PaintingSymmetry>,
     mirrors: Vec<StrokeRenderer>,
     mirror_distinct: Vec<bool>,
-    /// What the symmetric preview drew last, once a mirror differs from the stroke, and how many
-    /// passes it merged (a mirror joining redraws every tile).
+    /// What the merged preview drew last and how many passes it merged (a mirror
+    /// joining redraws every tile). A single pass uses the same incremental path.
     union_live: Option<(photocraft_paint::UnionLive, usize)>,
     pre: Surface,
     sel: Option<Surface>,
     lock: bool,
     layer: Option<photocraft_doc::LayerId>,
     params: Value,
-    /// Where the doc shows the stroke's end as finishing it would draw it (see `push`).
+    /// The union of the finished preview bounds across live updates (see `push`).
     tail: Rect,
     /// The document's CMYK profile the commit enters (`stroke_with`), so the preview shows the
     /// pixels a `paint.stroke` with `seed` will write.
@@ -580,43 +580,21 @@ impl LiveStroke {
                 }
             }
             let (surf, _) = crate::channel_cmds::target_surface(std::sync::Arc::make_mut(&mut self.doc), self.layer, &self.params)?;
-            if self.mirror_distinct.iter().any(|d| *d) {
-                // The stroke and its distinct mirrors composite as one stroke, as the commit
-                // merges them; only the tiles that changed are redrawn.
-                let old = self.tail;
-                let passes = 1 + self.mirror_distinct.iter().filter(|d| **d).count();
-                let (mut live, full, mut dmg) = match self.union_live.take() {
-                    Some((live, merged)) => (live, merged != passes, Rect::EMPTY),
-                    None => {
-                        // Leaving the single-pass preview: take its smoothing tail back first.
-                        if !old.is_empty() {
-                            surf.write_region(old, &self.pre.read_region(old));
-                        }
-                        (photocraft_paint::UnionLive::default(), true, old)
-                    }
-                };
-                let mut renderers: Vec<&mut StrokeRenderer> = std::iter::once(&mut self.renderer)
-                    .chain(self.mirrors.iter_mut().zip(&self.mirror_distinct).filter(|(_, d)| **d).map(|(r, _)| r))
-                    .collect();
-                dmg = dmg.union(&StrokeRenderer::composite_union_live(&mut renderers, &mut live, full, &self.pre, surf, self.sel.as_ref(), self.lock));
-                self.tail = old.union(&live.bounds());
-                self.union_live = Some((live, passes));
-                return Ok(dmg);
-            }
-            let mut dmg = Rect::EMPTY;
-            let old = std::mem::replace(&mut self.tail, Rect::EMPTY);
-            if !old.is_empty() {
-                // Back to the stroke without the previous tail.
-                surf.write_region(old, &self.pre.read_region(old));
-                self.renderer.mark_dirty(old);
-                dmg = old;
-            }
-            dmg = dmg.union(&self.renderer.composite(&self.pre, surf, self.sel.as_ref(), self.lock, false));
-            if let Some(mut tail) = self.renderer.tail_preview() {
-                self.tail = tail.composite(&self.pre, surf, self.sel.as_ref(), self.lock, false);
-                dmg = dmg.union(&self.tail);
-            }
-            Ok(dmg)
+            // The single pass needs the same merged-tail preview as symmetry. Restoring
+            // a whole large tail, redrawing the base stroke and then drawing the tail
+            // again used gigabytes of temporary floats and composited pixels twice.
+            let passes = 1 + self.mirror_distinct.iter().filter(|d| **d).count();
+            let (mut live, full) = match self.union_live.take() {
+                Some((live, merged)) => (live, merged != passes),
+                None => (photocraft_paint::UnionLive::default(), true),
+            };
+            let mut renderers: Vec<&mut StrokeRenderer> = std::iter::once(&mut self.renderer)
+                .chain(self.mirrors.iter_mut().zip(&self.mirror_distinct).filter(|(_, distinct)| **distinct).map(|(renderer, _)| renderer))
+                .collect();
+            let damage = StrokeRenderer::composite_union_live(&mut renderers, &mut live, full, &self.pre, surf, self.sel.as_ref(), self.lock);
+            self.tail = self.tail.union(&live.bounds());
+            self.union_live = Some((live, passes));
+            Ok(damage)
         })
     }
 }

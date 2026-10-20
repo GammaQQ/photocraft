@@ -1124,7 +1124,7 @@ fn live_union_of_passes_matches_merging_the_finished_passes_after_every_chunk() 
         for (bi, b) in brushes.iter().enumerate() {
             // (passes included at each chunk, selection): two passes from the start; four, of
             // which two join part-way.
-            for (four, selection) in [(false, None), (true, None), (true, Some(&sel))] {
+            for (four, selection, single) in [(false, None, true), (false, None, false), (true, None, false), (true, Some(&sel), false)] {
                 let mut renderers: Vec<StrokeRenderer> = (0..4).map(|_| StrokeRenderer::new(b, Some(fmt), 1.0)).collect();
                 let mut live = crate::render::UnionLive::default();
                 let mut target = pre.clone();
@@ -1134,7 +1134,13 @@ fn live_union_of_passes_matches_merging_the_finished_passes_after_every_chunk() 
                     for (r, path) in renderers.iter_mut().zip(&paths) {
                         r.push(&path[at..end]);
                     }
-                    let count = if four && at >= 12 { 4 } else { 2 };
+                    let count = if single {
+                        1
+                    } else if four && at >= 12 {
+                        4
+                    } else {
+                        2
+                    };
                     let full = merged != count;
                     merged = count;
                     let mut passes: Vec<&mut StrokeRenderer> = renderers.iter_mut().take(count).collect();

@@ -427,7 +427,7 @@ struct CovTile {
 /// A sparse tiled coverage (+ optional colour) buffer.
 #[derive(Clone, Debug, Default)]
 pub struct CoverageMap {
-    tiles: HashMap<(i32, i32), CovTile>,
+    tiles: HashMap<(i32, i32), Arc<CovTile>>,
     nc: usize,
     bounds: Rect,
     dirty: HashSet<(i32, i32)>,
@@ -480,11 +480,14 @@ impl CoverageMap {
                 if !any {
                     continue;
                 }
-                let tile = self.tiles.entry((tx, ty)).or_insert_with(|| CovTile {
-                    cov: vec![0.0; (COV_TILE * COV_TILE) as usize],
-                    depth: Vec::new(),
-                    col: if want_col { vec![0.0; (COV_TILE * COV_TILE) as usize * nc] } else { Vec::new() },
+                let tile = self.tiles.entry((tx, ty)).or_insert_with(|| {
+                    Arc::new(CovTile {
+                        cov: vec![0.0; (COV_TILE * COV_TILE) as usize],
+                        depth: Vec::new(),
+                        col: if want_col { vec![0.0; (COV_TILE * COV_TILE) as usize * nc] } else { Vec::new() },
+                    })
                 });
+                let tile = Arc::make_mut(tile);
                 if want_col && tile.col.is_empty() {
                     tile.col = vec![0.0; (COV_TILE * COV_TILE) as usize * nc];
                 }
@@ -523,6 +526,68 @@ impl CoverageMap {
         }
     }
 
+    /// Rasterise large dabs a coverage tile at a time. A 5000 px soft tip used to
+    /// allocate a dense ~300 MiB temporary before copying it into these same tiles.
+    /// Pixel coordinates and accumulation order within each tile stay identical.
+    fn rasterize_dab(&mut self, ctx: &BrushContext, dab: &Dab, dual: bool, scratch: &mut Vec<f32>, depth: &mut Vec<f32>, color: Option<&[f32]>) {
+        let rect = ctx.dab_rect(dab, dual);
+        if rect.is_empty() {
+            return;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if u64::from(rect.width()) * u64::from(rect.height()) >= 1024 * 1024 && rayon::current_num_threads() > 1 {
+            use rayon::prelude::*;
+            let mut tiles = Vec::new();
+            for ty in rect.y0.div_euclid(COV_TILE)..=(rect.y1 - 1).div_euclid(COV_TILE) {
+                for tx in rect.x0.div_euclid(COV_TILE)..=(rect.x1 - 1).div_euclid(COV_TILE) {
+                    tiles.push(((tx, ty), self.tiles.remove(&(tx, ty))));
+                }
+            }
+            let nc = self.nc;
+            tiles.par_iter_mut().for_each_init(
+                || (Vec::new(), Vec::new()),
+                |(scratch, depth), (key, tile)| {
+                    let (tx, ty) = *key;
+                    let part = Rect::new(tx * COV_TILE, ty * COV_TILE, (tx + 1) * COV_TILE, (ty + 1) * COV_TILE).intersect(&rect);
+                    // One local map owns this tile while its dab accumulates. The serial
+                    // accumulator remains the single definition of flow/colour/depth math.
+                    let mut local = CoverageMap::new(nc);
+                    if let Some(old) = tile.take() {
+                        local.tiles.insert(*key, old);
+                    }
+                    let wet = ctx.brush.wet_edges && !dual;
+                    ctx.rasterize_into(dab, dual, part, scratch, wet.then_some(&mut *depth));
+                    local.accumulate(part, scratch, if dual { 1.0 } else { dab.opacity }, color, wet.then_some(&depth[..]));
+                    *tile = local.tiles.remove(key);
+                },
+            );
+            self.bounds = self.bounds.union(&rect);
+            for (key, tile) in tiles {
+                if let Some(tile) = tile {
+                    self.tiles.insert(key, tile);
+                    self.dirty.insert(key);
+                }
+            }
+            return;
+        }
+        let wet = ctx.brush.wet_edges && !dual;
+        let pixels = (COV_TILE * COV_TILE) as usize;
+        if scratch.capacity() < pixels {
+            scratch.reserve_exact(pixels.saturating_sub(scratch.len()));
+        }
+        if wet && depth.capacity() < pixels {
+            depth.reserve_exact(pixels.saturating_sub(depth.len()));
+        }
+        let ceil = if dual { 1.0 } else { dab.opacity };
+        for ty in rect.y0.div_euclid(COV_TILE)..=(rect.y1 - 1).div_euclid(COV_TILE) {
+            for tx in rect.x0.div_euclid(COV_TILE)..=(rect.x1 - 1).div_euclid(COV_TILE) {
+                let part = Rect::new(tx * COV_TILE, ty * COV_TILE, (tx + 1) * COV_TILE, (ty + 1) * COV_TILE).intersect(&rect);
+                ctx.rasterize_into(dab, dual, part, scratch, wet.then_some(&mut *depth));
+                self.accumulate(part, scratch, ceil, color, wet.then_some(&depth[..]));
+            }
+        }
+    }
+
     fn take_dirty(&mut self) -> Vec<(i32, i32)> {
         let mut v: Vec<_> = self.dirty.drain().collect();
         v.sort_unstable();
@@ -546,6 +611,7 @@ impl CoverageMap {
                 self.dirty.insert(key);
                 continue;
             };
+            let target = Arc::make_mut(target);
             if target.depth.is_empty() {
                 target.depth.clone_from(&source.depth);
             } else {
@@ -711,13 +777,13 @@ impl StrokeRenderer {
         let mut keys: Vec<_> = keys.into_iter().collect();
         keys.sort_unstable();
         let mut dmg = Rect::EMPTY;
-        let mut region = Vec::new();
         for &(tx, ty) in &keys {
             let tile = Rect::new(tx * COV_TILE, ty * COV_TILE, (tx + 1) * COV_TILE, (ty + 1) * COV_TILE);
             let old = tile.intersect(&before);
-            if !old.is_empty() {
-                pre.read_region_into(old, &mut region);
-                target.write_region(old, &region);
+            // Compositing already starts from pre and overwrites the covered rectangle.
+            // Restore separately only where a previous smoothing tail has disappeared.
+            if !old.is_empty() && (!merged.cov.tiles.contains_key(&(tx, ty)) || !after.contains_rect(&old)) {
+                restore_region(pre, target, old);
                 dmg = dmg.union(&old);
             }
             if merged.cov.tiles.contains_key(&(tx, ty)) {
@@ -768,13 +834,8 @@ impl StrokeRenderer {
     fn raster_pending(&mut self) {
         let mut dabs = std::mem::take(&mut self.dab_buf);
         let mut duals = std::mem::take(&mut self.dual_buf);
-        let wet = self.ctx.brush.wet_edges;
         let mut native = [0.0f32; 8];
         for d in &dabs {
-            let rect = self.ctx.dab_rect(d, false);
-            // Wet Edges acts on the whole stroke (#2088): the dab records how deep it reaches each
-            // pixel and the stroke darkens its own rim when composited, not every dab's.
-            self.ctx.rasterize_into(d, false, rect, &mut self.scratch, wet.then_some(&mut self.depth_scratch));
             let col = match (self.per_dab_color, self.fmt) {
                 (true, Some(f)) => {
                     from_rgba_into(&f, d.color, &mut native);
@@ -782,15 +843,11 @@ impl StrokeRenderer {
                 }
                 _ => None,
             };
-            self.cov.accumulate(rect, &self.scratch, d.opacity, col, wet.then_some(&self.depth_scratch[..]));
-            // Bounds track the full dab rectangle (even fully transparent parts), like the damage.
-            self.cov.bounds = self.cov.bounds.union(&rect);
+            self.cov.rasterize_dab(&self.ctx, d, false, &mut self.scratch, &mut self.depth_scratch, col);
         }
         if let Some(dm) = self.dual.as_mut() {
             for d in &duals {
-                let rect = self.ctx.dab_rect(d, true);
-                self.ctx.rasterize(d, true, rect, &mut self.scratch);
-                dm.accumulate(rect, &self.scratch, 1.0, None, None);
+                dm.rasterize_dab(&self.ctx, d, true, &mut self.scratch, &mut self.depth_scratch, None);
             }
         }
         self.dabs_done += dabs.len();
@@ -948,6 +1005,183 @@ impl StrokeRenderer {
         (b, out)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn composite_u8<const N: usize>(
+        &self,
+        keys: &[(i32, i32)],
+        pre: &Surface,
+        target: &mut Surface,
+        selection: Option<&Surface>,
+        lock: bool,
+        src: &[f32; 8],
+        all: bool,
+    ) -> Rect {
+        #[cfg(not(target_arch = "wasm32"))]
+        if keys.len() >= 1024 && rayon::current_num_threads() > 1 {
+            use photocraft_geom::TileCoord;
+            use rayon::prelude::*;
+            use std::collections::BTreeMap;
+            let bounds = self.bounds();
+            let default = pre.default_pixel();
+            let transparent = default.last() == Some(&0.0) && default == target.default_pixel();
+            let mut groups: BTreeMap<TileCoord, Vec<(i32, i32)>> = BTreeMap::new();
+            let mut damage = Rect::EMPTY;
+            for &(tx, ty) in keys {
+                if !self.cov.tiles.contains_key(&(tx, ty)) {
+                    continue;
+                }
+                let rect = Rect::new(tx * COV_TILE, ty * COV_TILE, (tx + 1) * COV_TILE, (ty + 1) * COV_TILE).intersect(&bounds);
+                if rect.is_empty() {
+                    continue;
+                }
+                damage = damage.union(&rect);
+                let coord = TileCoord::containing(rect.x0, rect.y0);
+                if self.ctx.brush.erase && transparent && pre.tile(coord).is_none() && target.tile(coord).is_none() {
+                    continue;
+                }
+                groups.entry(coord).or_default().push((tx, ty));
+            }
+            let fmt = target.format();
+            let target_default = target.default_pixel();
+            // Move disjoint surface tiles to workers rather than sharing a mutable surface.
+            // Only the affected tiles are taken; sparse gaps never become allocations.
+            let mut jobs: Vec<_> = groups.into_iter().map(|(coord, keys)| (coord, keys, target.take_tiles(coord.rect()))).collect();
+            jobs.par_iter_mut().for_each(|(coord, keys, tiles)| {
+                let mut local = Surface::with_default(fmt, &target_default);
+                local.put_tiles(std::mem::take(tiles));
+                self.composite_u8_serial::<N>(keys, pre, &mut local, selection, lock, src, false);
+                *tiles = local.take_tiles(coord.rect());
+            });
+            for (_, _, tiles) in jobs {
+                target.put_tiles(tiles);
+            }
+            return if all { bounds } else { damage };
+        }
+        self.composite_u8_serial::<N>(keys, pre, target, selection, lock, src, all)
+    }
+
+    /// Byte-tile counterpart of the generic compositor. Keep the same float arithmetic
+    /// and coordinate-based dither; only the temporary format conversion is removed.
+    #[allow(clippy::too_many_arguments)]
+    fn composite_u8_serial<const N: usize>(
+        &self,
+        keys: &[(i32, i32)],
+        pre: &Surface,
+        target: &mut Surface,
+        selection: Option<&Surface>,
+        lock: bool,
+        src: &[f32; 8],
+        all: bool,
+    ) -> Rect {
+        use photocraft_geom::{TILE_SIZE, TileCoord};
+        let bounds = self.bounds();
+        let b = &self.ctx.brush;
+        let opacity = b.opacity.clamp(0.0, 1.0);
+        let default = pre.default_pixel();
+        let mut blank = [0u8; N];
+        let same_default = default == target.default_pixel();
+        for (dst, value) in blank.iter_mut().zip(default.iter().copied()) {
+            *dst = (value.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+        }
+        let mut damage = Rect::EMPTY;
+        for &(tx, ty) in keys {
+            let Some(coverage) = self.cov.tiles.get(&(tx, ty)) else { continue };
+            let tr = Rect::new(tx * COV_TILE, ty * COV_TILE, (tx + 1) * COV_TILE, (ty + 1) * COV_TILE).intersect(&bounds);
+            if tr.is_empty() {
+                continue;
+            }
+            damage = damage.union(&tr);
+            let coord = TileCoord::containing(tr.x0, tr.y0);
+            let original = pre.tile(coord).map(|tile| tile.bytes());
+            // Erasing untouched transparent tiles cannot change their bytes. In
+            // particular, a huge eraser must not materialise empty off-canvas tiles.
+            if b.erase && same_default && original.is_none() && blank.last() == Some(&0) && target.tile(coord).is_none() {
+                continue;
+            }
+            // On transparent tiles, exact 0/1 source channels remain exact 0/1
+            // through source-over and 8-bit dither. Only alpha needs arithmetic.
+            let solid = !b.erase
+                && !lock
+                && original.is_none()
+                && blank[N - 1] == 0
+                && src[N - 1] > 0.0
+                && src[N - 1].is_finite()
+                && src[..N - 1].iter().all(|c| *c == 0.0 || *c == 1.0);
+            let mut solid_pixel = [0u8; N];
+            for (byte, value) in solid_pixel.iter_mut().zip(src) {
+                *byte = if *value == 1.0 { 255 } else { 0 };
+            }
+            let sel = selection.map(|s| (s.channels(), s.read_region(tr)));
+            let dst = target.tile_mut(coord).bytes_mut();
+            let width = tr.width() as usize;
+            for y in tr.y0..tr.y1 {
+                let base = ((y - coord.ty * TILE_SIZE) as usize * TILE_SIZE as usize + (tr.x0 - coord.tx * TILE_SIZE) as usize) * N;
+                let Some(row) = dst.get_mut(base..base + width * N) else { continue };
+                if let Some(old) = original.and_then(|bytes| bytes.get(base..base + width * N)) {
+                    row.copy_from_slice(old);
+                } else {
+                    for pixel in row.as_chunks_mut::<N>().0.iter_mut() {
+                        pixel.copy_from_slice(&blank);
+                    }
+                }
+                let first = ((y - ty * COV_TILE) * COV_TILE + tr.x0 - tx * COV_TILE) as usize;
+                let Some(coverages) = coverage.cov.get(first..first + width) else { continue };
+                for (xx, (pixel, &c)) in row.as_chunks_mut::<N>().0.iter_mut().zip(coverages).enumerate() {
+                    if c <= 0.0 {
+                        continue;
+                    }
+                    let x = tr.x0 + xx as i32;
+                    let ti = first + xx;
+                    let m = self.ctx.stroke_mask_wet(c, coverage.depth.get(ti).copied(), self.dual.as_ref().map(|d| d.get(x, y)), x, y);
+                    let i = (y - tr.y0) as usize * width + xx;
+                    let selected = sel.as_ref().map_or(1.0, |(channels, values)| values.get(i * channels).copied().unwrap_or(0.0));
+                    let k = (m * opacity * selected).min(1.0);
+                    if k <= 0.0 {
+                        continue;
+                    }
+                    if solid && src[N - 1] * k > 0.0 {
+                        pixel.copy_from_slice(&solid_pixel);
+                        let alpha = src[N - 1] * k;
+                        let noise = if b.aliased { 0.0 } else { (hash2(x, y, DITHER_SALT) - 0.5) / 255.0 };
+                        pixel[N - 1] = ((alpha + noise).clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                        continue;
+                    }
+                    let mut px = [0.0; N];
+                    for (value, byte) in px.iter_mut().zip(pixel.iter()) {
+                        *value = f32::from(*byte) / 255.0;
+                    }
+                    let alpha = N - 1;
+                    if b.erase {
+                        if !lock {
+                            px[alpha] *= 1.0 - k;
+                        }
+                    } else {
+                        if lock && px[alpha] <= 0.0 {
+                            continue;
+                        }
+                        let (da, sa) = (px[alpha], src[alpha] * k);
+                        let oa = sa + da * (1.0 - sa);
+                        if oa > 0.0 {
+                            for ch in 0..alpha {
+                                px[ch] = (src[ch] * sa + px[ch] * da * (1.0 - sa)) / oa;
+                            }
+                        }
+                        if !lock {
+                            px[alpha] = oa;
+                        }
+                    }
+                    if !b.aliased {
+                        dither8(&mut px, x, y);
+                    }
+                    for (byte, value) in pixel.iter_mut().zip(px) {
+                        *byte = (value.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                    }
+                }
+            }
+        }
+        if all { bounds } else { damage }
+    }
+
     /// Composite the stroke buffer onto `target`, reading original pixels from `pre` (the
     /// pre-stroke surface; pass a clone of the target taken before the first `push`). With
     /// `all = false` only tiles touched since the last composite are processed (interactive use).
@@ -981,6 +1215,17 @@ impl StrokeRenderer {
         }
         if let Some(a) = a_idx {
             src[a] = b.color[3];
+        }
+        // The common alpha-bearing 8-bit formats can blend directly in the surface's
+        // byte tiles. Avoid decoding, clearing and re-encoding an intermediate float
+        // region for every 64x64 coverage tile (also on single-threaded WebAssembly).
+        if keys.len() >= 256 && pre.format() == fmt && fmt.sample == SampleType::U8 && fmt.alpha && b.mode == BlendMode::Normal && !self.per_dab_color {
+            match n {
+                2 => return self.composite_u8::<2>(&keys, pre, target, selection, lock_transparency, &src, all),
+                4 => return self.composite_u8::<4>(&keys, pre, target, selection, lock_transparency, &src, all),
+                5 => return self.composite_u8::<5>(&keys, pre, target, selection, lock_transparency, &src, all),
+                _ => {}
+            }
         }
         // 8-bit targets: the pixels the stroke changes are dithered as they are quantised, so
         // soft, low-flow strokes don't band (see `dither8`). Aliased strokes (the Pencil, the
@@ -1113,3 +1358,60 @@ fn rasterize_round(d: &Dab, rect: Rect, out: &mut [f32], hardness: f32, aliased:
 #[cfg(test)]
 #[path = "render_reference.rs"]
 mod reference;
+
+/// Restore a live preview region from its pre-stroke pixels without a dense float
+/// buffer. Whole tiles share their original storage; edge tiles copy native bytes.
+/// This keeps large smoothing tails bounded in temporary memory at every depth.
+pub fn restore_region(pre: &Surface, target: &mut Surface, rect: Rect) {
+    if rect.is_empty() {
+        return;
+    }
+    if pre.format() != target.format() {
+        // Retain the region API's conversion behavior for callers with different depths.
+        let mut region = Vec::new();
+        for coord in rect.tiles() {
+            let part = coord.rect().intersect(&rect);
+            pre.read_region_into(part, &mut region);
+            target.write_region(part, &region);
+        }
+        return;
+    }
+    use photocraft_geom::TILE_SIZE;
+    let bpp = pre.format().bytes_per_pixel();
+    let default = pre.default_bytes();
+    let same_default = default == target.default_bytes();
+    for coord in rect.tiles() {
+        let tile_rect = coord.rect();
+        let part = tile_rect.intersect(&rect);
+        let original = pre.tile(coord);
+        if part == tile_rect {
+            if let Some(original) = original {
+                target.put_tiles(std::iter::once((coord, Arc::clone(original))));
+                continue;
+            }
+            if same_default {
+                if target.tile(coord).is_some() {
+                    // Discard the preview's tile; absence reads the original default.
+                    drop(target.take_tiles(tile_rect));
+                }
+                continue;
+            }
+        }
+        if original.is_none() && same_default && target.tile(coord).is_none() {
+            continue;
+        }
+        let bytes = target.tile_mut(coord).bytes_mut();
+        for y in part.y0..part.y1 {
+            let first = ((y - coord.ty * TILE_SIZE) as usize * TILE_SIZE as usize + (part.x0 - coord.tx * TILE_SIZE) as usize) * bpp;
+            let end = first + part.width() as usize * bpp;
+            let Some(dst) = bytes.get_mut(first..end) else { continue };
+            if let Some(src) = original.and_then(|tile| tile.bytes().get(first..end)) {
+                dst.copy_from_slice(src);
+            } else {
+                for pixel in dst.chunks_exact_mut(bpp) {
+                    pixel.copy_from_slice(default);
+                }
+            }
+        }
+    }
+}

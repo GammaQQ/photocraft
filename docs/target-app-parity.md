@@ -1,6 +1,6 @@
 # PhotoCraft vs Adobe Photoshop: target-app parity
 
-> **Last reviewed:** 2026-10-12 · **Last updated:** 2026-10-18 · **Change:** minor (fill and adjustment layers copy and paste whole, UI-217-23 partial, #2344; on-canvas corner radius widgets, TOOL-214-12; `.atn` import maps 112 events; Free Transform H/V skew fields; stale rows corrected against `main` and the scorecard, estimates unchanged; Photoshop Actions `.atn` load and save; 2026-10-10: Tilt-Shift measurements added; earlier the same day: major, full re-measure against Photoshop 2026 27.11.0; merged `parity-estimate.md` and the roadmap's honest assessment; stale missing-tool rows corrected: Color Replacement and Red Eye are live toolbar tools, Frame landed; percentages unchanged) · **Target:** Adobe Photoshop 2026
+> **Last reviewed:** 2026-10-12 · **Last updated:** 2026-10-20 · **Change:** minor (large-brush and symmetry preview performance evidence, estimates unchanged; fill and adjustment layers copy and paste whole, UI-217-23 partial, #2344; on-canvas corner radius widgets, TOOL-214-12; `.atn` import maps 112 events; Free Transform H/V skew fields; stale rows corrected against `main` and the scorecard, estimates unchanged; Photoshop Actions `.atn` load and save; 2026-10-10: Tilt-Shift measurements added; earlier the same day: major, full re-measure against Photoshop 2026 27.11.0; merged `parity-estimate.md` and the roadmap's honest assessment; stale missing-tool rows corrected: Color Replacement and Red Eye are live toolbar tools, Frame landed; percentages unchanged) · **Target:** Adobe Photoshop 2026
 
 The authoritative answer to "how close is PhotoCraft to Photoshop, and how much work is left". The
 one-page summary is [`ROADMAP.md`](../ROADMAP.md); the ranked work list is [`gaps.md`](gaps.md);
@@ -384,6 +384,13 @@ Confidence: moderate — the next users of 0.2.x will move these numbers either 
 
 ### By dimension
 
+2026-10-20: the shared painting pipeline avoids dense smoothing-tail restoration,
+shares coverage tiles and composites large native updates in parallel. Default-canvas
+5000 px brush/eraser CPU preview p50 improves 2187.62 → 591.84 / 2366.55 → 290.37 ms;
+symmetry p95 improves 17.41 → 13.81 ms. These are local computation measurements;
+large-brush frame budgets remain unmet and parity percentages are unchanged.
+[Method, limitations and raw samples](brush-performance.md).
+
 2026-10-10: Tilt-Shift reuses the established contiguous premultiplication and
 per-level trailing-halo trimming. Nine local 24 MP RGB U8/U16/F32 cases improve
 1.07–1.49× with separated observed ranges (Ryzen 7 9700X, Windows, eight workers):
@@ -565,6 +572,7 @@ See [method, raw measurements and reproduction](five-algorithm-performance.md).
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-20 | minor | Recorded large brush/eraser and symmetry preview computation improvements; no parity percentage or enforced budget changed |
 | 2026-10-18 | minor | Layers: with no selection, Copy takes fill and adjustment layers whole and Paste recreates them (#2344); UI-217-23 stays partial; percentages unchanged |
 | 2026-10-13 | minor | Vector shapes: on-canvas corner radius widgets on live rectangles (TOOL-214-12); estimates unchanged |
 | 2026-10-13 | minor | Stale "missing tool" rows corrected against main: Color Replacement (`paint.colorReplacement`), Red Eye (`paint.redEye`) and Add/Delete Anchor Point (the Pen flyout) are live toolbar tools and Frame landed, so Art History Brush is the only tool still missing; percentages unchanged |

@@ -536,3 +536,36 @@ bench = "perf_scenarios"
 row = "hide a layer among many full-canvas layers + refresh"
 budget_ms = 30
 enforce = false  # new; no baseline yet
+
+[[bench]]
+name = "bench_interactive_brush"
+package = "photocraft-paint"
+quick_args = ["--quick"]
+note = "5000 px brush/eraser previews including smoothing-tail restoration; 120-event mirrored stroke; full run uses a 24 MP layer"
+
+[[scenario]]
+id = "P62"
+title = "5000 px brush preview update with smoothing"
+bench = "bench_interactive_brush"
+row = "large brush"
+metric = "max"
+budget_ms = 16
+enforce = false
+
+[[scenario]]
+id = "P63"
+title = "5000 px eraser preview update with smoothing"
+bench = "bench_interactive_brush"
+row = "large eraser"
+metric = "max"
+budget_ms = 16
+enforce = false
+
+[[scenario]]
+id = "P64"
+title = "Fast mirrored brush preview update with smoothing"
+bench = "bench_interactive_brush"
+row = "rapid symmetry"
+metric = "max"
+budget_ms = 16
+enforce = false
