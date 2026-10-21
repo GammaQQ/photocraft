@@ -50,18 +50,21 @@ actual browser and Windows latency still require their respective runtimes.
 These changes reduce the reproduced stalls; they do not establish a 16 ms budget
 for a 5000 px brush. Large strokes can still take hundreds of milliseconds or more,
 and layer effects, canvas composition and display upload are outside this harness.
-Brush latency therefore stays **partial**, and P62–P64 remain unenforced targets.
+Brush latency therefore stays **partial**.
 The existing performance baseline and parity percentages are unchanged.
 
 Raw samples and context: [brush-performance-2026-10-20.json](../perf/brush-performance-2026-10-20.json).
 
-## Reproduce and monitor
+## Reproduce manually
+
+The repository already has benchmark examples and a nightly performance workflow.
+This additional benchmark is available for manual investigation only; it is not
+registered in `perf/budgets.toml` or run by any workflow.
 
 ```sh
 cargo run --release --locked -p photocraft-paint --example bench_interactive_brush -- --quick --json target/brush-default.json
 cargo run --release --locked -p photocraft-paint --example bench_interactive_brush -- --json target/brush-24mp.json
 RAYON_NUM_THREADS=1 cargo run --release --locked -p photocraft-paint --example bench_interactive_brush -- --quick --json target/brush-serial.json
-cargo xtask perf --quick --bench bench_interactive_brush
 ```
 
 The checked-in benchmark follows the current `LiveStroke` preview path. Before
@@ -69,9 +72,5 @@ measurements used the original rasterizer/compositor and the original single-pas
 restore/base/tail sequence with the same input trace and release profile. Runs
 were sequential, without concurrent Cargo builds; normal runner noise remains.
 
-`brush-performance.yml` runs paint pixel/allocation regressions, live-stroke tests,
-Clippy, WebAssembly compilation and native/serial release samples on Linux and
-Windows. Measurements are uploaded as artifacts. Portable correctness and storage
-invariants gate CI; noisy wall-clock samples are reported rather than used as a
-universal hardware threshold. The existing main CI and release workflows continue
-to provide their broader checks and release process.
+Pixel, storage and live-stroke regression tests remain in the normal test suites,
+covered by the existing CI workflow.
